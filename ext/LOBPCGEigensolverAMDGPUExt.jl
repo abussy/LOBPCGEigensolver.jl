@@ -2,20 +2,9 @@ module LOBPCGEigensolverAMDGPUExt
 using AMDGPU
 using LinearAlgebra
 
-# Workarounds for LinearAlgebra routines that LOBPCG relies on (Cholesky
-# orthogonalization, the SVD fallback, and 5-argument `mul!`) but that are
-# currently broken or slow for AMDGPU `ROCArray`s.
-
-# Temporary workaround to not trigger https://github.com/JuliaGPU/AMDGPU.jl/issues/734
-function LinearAlgebra.cholesky(A::Hermitian{T, <:AMDGPU.ROCArray}) where {T}
-    Acopy, info = AMDGPU.rocSOLVER.potrf!(A.uplo, copy(A.data))
-    LinearAlgebra.Cholesky(Acopy, A.uplo, info)
-end
-
-# Temporary workaround for SVD. See https://github.com/JuliaGPU/AMDGPU.jl/issues/837
-function LinearAlgebra.LAPACK.gesdd!(jobz::Char, A::AMDGPU.ROCArray{T}) where {T}
-    AMDGPU.rocSOLVER.gesvd!(jobz, jobz, A)
-end
+# Workarounds for LinearAlgebra routines that LOBPCG relies on, but that are
+# currently broken or slow for AMDGPU `ROCArray`s. As of August 2026, it's
+# only the 5-argument mul!
 
 # Temporary workaround for 5-argument mul!, where performance is very bad when array
 # element types and scaling factors types differ.
