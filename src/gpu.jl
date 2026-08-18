@@ -14,7 +14,7 @@ end
 
 # Apply the Cholesky factorization N times to orthogonalize X. If it fails, e.g. because
 # it might be ill-conditioned, fall back to the slower but more robust ortho! function.
-function ortho_chol_n!(X::AbstractGPUArray{T}; N::Int=2) where {T}
+function ortho_chol_n!(X::AbstractArray{T}; N::Int=2) where {T}
     nchol_total = 0
     try
         for _ = 1:N
@@ -35,7 +35,7 @@ end
 # synchronization, which is avoided here. In practice, ortho! usually converges after 2
 # iterations or more. Here, we only start checking for convergence after 2 iterations,
 # in order to streamline GPU execution
-function ortho!(X::AbstractGPUArray{T}, Y, BY; tol=2eps(real(T)),
+function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T)),
                      timer=disabled_timer) where {T}
 
     # normalize to try to cheaply improve conditioning
@@ -75,7 +75,7 @@ function ortho!(X::AbstractGPUArray{T}, Y, BY; tol=2eps(real(T)),
     # we revert to the slower ortho!, which knows how to deal with this.
     dropped = drop_small!(X; tol)
     if !isempty(dropped)
-        X = invoke(ortho!, Tuple{AbstractArray{T}, Any, Any}, X, Y, BY; tol=tol, timer=timer)
+        X = safe_ortho!(X, Y, BY; tol=tol, timer=timer)
     end
 
     X

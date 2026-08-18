@@ -53,95 +53,21 @@ disable_timer!(disabled_timer)
 
 
 import LinearAlgebra: BlasFloat
-import Base: *
-
-"""
-Simple wrapper to represent a matrix formed by the concatenation of
-column blocks: it is mostly equivalent to hcat, but doesn't allocate
-the full matrix.
-
-A multiplication involving this structure will always yield a plain
-array (and not a LazyHcat structure).
-
-LazyHcat is a lightweight subset of BlockArrays.jl's functionalities,
-but has the advantage to be able to store GPU Arrays (BlockArrays is
-heavily built on Julia's CPU Array). LazyHcat only supports a few
-multiplication routines, those needed by LOBPCG : A'B with A and B
-LazyHcat, and A*B with A LazyHCat and B a plain matrix.
-"""
-struct LazyHcat{T<:Number, D<:Tuple} <: AbstractMatrix{T}
-    blocks::D
-end
-
-# Convenience functions
-function LazyHcat(arrays::AbstractArray...)
-    @assert length(arrays) != 0
-    n_ref = size(arrays[1], 1)
-    @assert  all(size.(arrays, 1) .== n_ref)
-
-    T = promote_type(map(eltype, arrays)...)
-
-    LazyHcat{T, typeof(arrays)}(arrays)
-end
-function Base.size(A::LazyHcat)
-    n = size(A.blocks[1], 1)
-    m = sum(size(block, 2) for block in A.blocks)
-    (n, m)
-end
-Base.Array(A::LazyHcat)   = stack(A.blocks)
-Base.adjoint(A::LazyHcat) = Adjoint(A)
-
-# Computes A*B matrix product when B is a LazyHcat and A is a LazyVcat (adjoint of LazyHcat).
-# Special case if product is known to be Hermitian, since only the upper block diagonal is needed.
-# This _mul function is used for the standard and Hermitian cases (see mul_hermi function below)
-@views function _mul(A::Adjoint{T,<:LazyHcat}, B::LazyHcat; hermitian=Val(false)) where {T}
-    Ap = A.parent
-    rows = size(Ap, 2)
-    cols = size(B, 2)
-    ret = similar(B.blocks[1], rows, cols)
-
-    # Only populate the upper block diagonal in Hermitian case
-    ocol = 0  # column offset
-    for (ib, blB) in enumerate(B.blocks)
-        orow = 0  # row offset
-        for (ia, blA) in enumerate(Ap.blocks)
-            (hermitian isa Val{true} && ib < ia) && continue
-            ret[orow .+ (1:size(blA, 2)), ocol .+ (1:size(blB, 2))] .= blA' * blB
-            orow += size(blA, 2)
-        end
-        ocol += size(blB, 2)
-    end
-
-    if hermitian isa Val{true}
-        Hermitian(ret)
-    else
-        ret
-    end
-end
-Base.:*(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}       = _mul(A, B)
-Base.:*(A::Adjoint{T,<:LazyHcat}, B::AbstractMatrix) where {T} = A * LazyHcat(B)
 
 # General A*B product when the result is known to be Hermitian
 mul_hermi(A, B) = Hermitian(A * B)
-function mul_hermi(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}
-    _mul(A, B; hermitian=Val(true))
-end
 
-# LazyHCat * Matrix
-@views function LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat,
-                                   B::AbstractMatrix, α::Number, β::Number)
-    offset = 0
-    for (i, block) in enumerate(Ablock.blocks)
-        mul!(res, block, B[offset .+ (1:size(block, 2)), :], α, i == 1 ? β : true)
-        offset += size(block, 2)
+# Fill dest with the column-wise concatenation of the passed blocks.
+# Used to build contiguous Rayleigh-Ritz subspace buffers from separate X/R/P blocks,
+# allowing large BLAS3 kernels instead of many small block products.
+function fill_hcat!(dest::AbstractMatrix, blocks::AbstractMatrix...)
+    col = 0
+    for block in blocks
+        n = size(block, 2)
+        copyto!(view(dest, :, col+1:col+n), block)
+        col += n
     end
-    res
-end
-LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat, B::AbstractMatrix) =
-    mul!(res, Ablock, B, true, false)
-function *(Ablock::LazyHcat, B::AbstractMatrix)
-    res = zeros_like(B, size(Ablock, 1), size(B, 2))
-    mul!(res, Ablock, B)
+    dest
 end
 
 
@@ -158,7 +84,7 @@ end
     values, vectors = eigen(XAX)
     vectors[:, 1:N], values[1:N]
 end
-@views function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:Array}, N)
+@views function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:StridedMatrix}, N)
     # LAPACK sysevr (the Julia default eigensolver up to 1.11 ) can actually return
     # eigenvectors that are significantly non-orthogonal (1e-4 in Float32 in some tests)
     # here, presumably because it tries hard to make them eigenvectors in the presence
@@ -276,7 +202,7 @@ function drop_small!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
 end
 
 # Find X that is orthogonal, and B-orthogonal to Y, up to a tolerance tol.
-function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T)),
+function safe_ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T)),
                 timer=disabled_timer) where {T}
     # normalize to try to cheaply improve conditioning
     X ./= columnwise_norms(X)'
@@ -396,7 +322,7 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
     N >= 3M+5 || @warn error_message("might")
 
     isnothing(n_conv_check) && (n_conv_check = M)
-    resid_history = zeros(real(eltype(X)), M, maxiter+1)
+    resid_history = zeros_like(X, real(eltype(X)), M, maxiter+1)
 
     # B-orthogonalize X
     X = @timeit timer "ortho!" ortho!(copy(X), tol=ortho_tol)[1]
@@ -433,6 +359,15 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
         BX = X
         BP = P
     end
+
+    # Pre-allocate contiguous Rayleigh-Ritz subspace buffers.
+    # When B == I we alias the B buffers to the Y/Z buffers to avoid duplicate copies.
+    Y_buf  = zeros_like(X, N, 3M)
+    AY_buf = zeros_like(X, N, 3M)
+    BY_buf = B == I ? Y_buf : zeros_like(X, N, 3M)
+    Z_buf  = zeros_like(X, N, 2M)
+    BZ_buf = B == I ? Z_buf : zeros_like(X, N, 2M)
+
     nlocked = 0
     niter = 0  # the first iteration is fake
     λs = compute_λ(X, AX, BX)
@@ -451,13 +386,21 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
 
             # Form Rayleigh-Ritz subspace
             if niter > 1
-                Y  = LazyHcat(X, R, P)
-                AY = LazyHcat(AX, AR, AP)
-                BY = LazyHcat(BX, BR, BP)  # data shared with (X, R, P) in non-general case
+                ncols = 3 * (M - nlocked)
+                Y  = view(Y_buf,  :, 1:ncols)
+                AY = view(AY_buf, :, 1:ncols)
+                BY = view(BY_buf, :, 1:ncols)
+                fill_hcat!(Y,  X, R, P)
+                fill_hcat!(AY, AX, AR, AP)
+                B != I && fill_hcat!(BY, BX, BR, BP)
             else
-                Y  = LazyHcat(X, R)
-                AY = LazyHcat(AX, AR)
-                BY = LazyHcat(BX, BR)  # data shared with (X, R) in non-general case
+                ncols = 2 * (M - nlocked)
+                Y  = view(Y_buf,  :, 1:ncols)
+                AY = view(AY_buf, :, 1:ncols)
+                BY = view(BY_buf, :, 1:ncols)
+                fill_hcat!(Y,  X, R)
+                fill_hcat!(AY, AX, AR)
+                B != I && fill_hcat!(BY, BX, BR)
             end
             cX, λs_RR = @timeit timer "rayleigh_ritz" rayleigh_ritz(Y, AY, M-nlocked)
             λs .= λs_RR
@@ -474,7 +417,7 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
         ### Compute new residuals
         @timeit timer "Update residuals" begin
             new_R .= new_AX .- new_BX .* λs'
-            norms = to_cpu(columnwise_norms(new_R))
+            norms = columnwise_norms(new_R)
             @views resid_history[1 + nlocked: size(new_R, 2) + nlocked, niter+1] .= norms[:]
         end
         @debug niter resid_history[:, niter+1]
@@ -595,8 +538,11 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
 
         # Orthogonalize R wrt all X, newly active P
         if niter > 0
-            Z  = LazyHcat(full_X, P)
-            BZ = LazyHcat(full_BX, BP)  # data shared with (full_X, P) in non-general case
+            ncolsZ = M + size(P, 2)
+            Z  = view(Z_buf,  :, 1:ncolsZ)
+            BZ = view(BZ_buf, :, 1:ncolsZ)
+            fill_hcat!(Z, full_X, P)
+            B != I && fill_hcat!(BZ, full_BX, BP)
         else
             Z  = full_X
             BZ = full_BX
