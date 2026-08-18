@@ -322,7 +322,9 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
     N >= 3M+5 || @warn error_message("might")
 
     isnothing(n_conv_check) && (n_conv_check = M)
-    resid_history = zeros_like(X, real(eltype(X)), M, maxiter+1)
+    # Keep residual history on the CPU: the locking loop performs scalar indexing,
+    # which is disallowed on GPU arrays, and the history is small (M × maxiter).
+    resid_history = zeros(real(eltype(X)), M, maxiter+1)
 
     # B-orthogonalize X
     X = @timeit timer "ortho!" ortho!(copy(X), tol=ortho_tol)[1]
@@ -361,12 +363,12 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
     end
 
     # Pre-allocate contiguous Rayleigh-Ritz subspace buffers.
-    # When B == I we alias the B buffers to the Y/Z buffers to avoid duplicate copies.
+    # When B == I we alias the B buffer to Y_buf to avoid duplicate copies.
+    # Z/BZ reuse Y_buf/AY_buf after the Rayleigh-Ritz/P-update step, since
+    # Y/AY are no longer needed then.
     Y_buf  = zeros_like(X, N, 3M)
     AY_buf = zeros_like(X, N, 3M)
     BY_buf = B == I ? Y_buf : zeros_like(X, N, 3M)
-    Z_buf  = zeros_like(X, N, 2M)
-    BZ_buf = B == I ? Z_buf : zeros_like(X, N, 2M)
 
     nlocked = 0
     niter = 0  # the first iteration is fake
@@ -418,7 +420,7 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
         @timeit timer "Update residuals" begin
             new_R .= new_AX .- new_BX .* λs'
             norms = columnwise_norms(new_R)
-            @views resid_history[1 + nlocked: size(new_R, 2) + nlocked, niter+1] .= norms[:]
+            @views resid_history[1 + nlocked: size(new_R, 2) + nlocked, niter+1] .= to_cpu(norms)
         end
         @debug niter resid_history[:, niter+1]
 
@@ -539,10 +541,16 @@ function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
         # Orthogonalize R wrt all X, newly active P
         if niter > 0
             ncolsZ = M + size(P, 2)
-            Z  = view(Z_buf,  :, 1:ncolsZ)
-            BZ = view(BZ_buf, :, 1:ncolsZ)
+            # Reuse Y_buf/AY_buf for the residual-orthogonalization basis.
+            # This is safe: Y and AY are no longer needed after the P update.
+            Z = view(Y_buf, :, 1:ncolsZ)
             fill_hcat!(Z, full_X, P)
-            B != I && fill_hcat!(BZ, full_BX, BP)
+            if B != I
+                BZ = view(AY_buf, :, 1:ncolsZ)
+                fill_hcat!(BZ, full_BX, BP)
+            else
+                BZ = Z
+            end
         else
             Z  = full_X
             BZ = full_BX
