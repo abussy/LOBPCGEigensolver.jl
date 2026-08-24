@@ -74,7 +74,7 @@ struct LazyHcat{T<:Number, D<:Tuple} <: AbstractMatrix{T}
 end
 
 # Convenience functions
-function LazyHcat(arrays::AbstractArray...)
+NVTX.@annotate function LazyHcat(arrays::AbstractArray...)
     @assert length(arrays) != 0
     n_ref = size(arrays[1], 1)
     @assert  all(size.(arrays, 1) .== n_ref)
@@ -83,98 +83,106 @@ function LazyHcat(arrays::AbstractArray...)
 
     LazyHcat{T, typeof(arrays)}(arrays)
 end
-function Base.size(A::LazyHcat)
+NVTX.@annotate function Base.size(A::LazyHcat)
     n = size(A.blocks[1], 1)
     m = sum(size(block, 2) for block in A.blocks)
     (n, m)
 end
-Base.Array(A::LazyHcat)   = stack(A.blocks)
-Base.adjoint(A::LazyHcat) = Adjoint(A)
+NVTX.@annotate Base.Array(A::LazyHcat)   = stack(A.blocks)
+NVTX.@annotate Base.adjoint(A::LazyHcat) = Adjoint(A)
 
 # Computes A*B matrix product when B is a LazyHcat and A is a LazyVcat (adjoint of LazyHcat).
 # Special case if product is known to be Hermitian, since only the upper block diagonal is needed.
 # This _mul function is used for the standard and Hermitian cases (see mul_hermi function below)
-@views function _mul(A::Adjoint{T,<:LazyHcat}, B::LazyHcat; hermitian=Val(false)) where {T}
-    Ap = A.parent
-    rows = size(Ap, 2)
-    cols = size(B, 2)
-    ret = similar(B.blocks[1], rows, cols)
+NVTX.@annotate function _mul(A::Adjoint{T,<:LazyHcat}, B::LazyHcat; hermitian=Val(false)) where {T}
+    @views begin
+        Ap = A.parent
+        rows = size(Ap, 2)
+        cols = size(B, 2)
+        ret = similar(B.blocks[1], rows, cols)
 
-    # Only populate the upper block diagonal in Hermitian case
-    ocol = 0  # column offset
-    for (ib, blB) in enumerate(B.blocks)
-        orow = 0  # row offset
-        for (ia, blA) in enumerate(Ap.blocks)
-            (hermitian isa Val{true} && ib < ia) && continue
-            ret[orow .+ (1:size(blA, 2)), ocol .+ (1:size(blB, 2))] .= blA' * blB
-            orow += size(blA, 2)
+        # Only populate the upper block diagonal in Hermitian case
+        ocol = 0  # column offset
+        for (ib, blB) in enumerate(B.blocks)
+            orow = 0  # row offset
+            for (ia, blA) in enumerate(Ap.blocks)
+                (hermitian isa Val{true} && ib < ia) && continue
+                ret[orow .+ (1:size(blA, 2)), ocol .+ (1:size(blB, 2))] .= blA' * blB
+                orow += size(blA, 2)
+            end
+            ocol += size(blB, 2)
         end
-        ocol += size(blB, 2)
-    end
 
-    if hermitian isa Val{true}
-        Hermitian(ret)
-    else
-        ret
+        if hermitian isa Val{true}
+            Hermitian(ret)
+        else
+            ret
+        end
     end
 end
-Base.:*(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}       = _mul(A, B)
-Base.:*(A::Adjoint{T,<:LazyHcat}, B::AbstractMatrix) where {T} = A * LazyHcat(B)
+NVTX.@annotate Base.:*(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}       = _mul(A, B)
+NVTX.@annotate Base.:*(A::Adjoint{T,<:LazyHcat}, B::AbstractMatrix) where {T} = A * LazyHcat(B)
 
 # General A*B product when the result is known to be Hermitian
-mul_hermi(A, B) = Hermitian(A * B)
-function mul_hermi(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}
+NVTX.@annotate mul_hermi(A, B) = Hermitian(A * B)
+NVTX.@annotate function mul_hermi(A::Adjoint{T,<:LazyHcat}, B::LazyHcat) where {T}
     _mul(A, B; hermitian=Val(true))
 end
 
 # LazyHCat * Matrix
-@views function LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat,
-                                   B::AbstractMatrix, α::Number, β::Number)
-    offset = 0
-    for (i, block) in enumerate(Ablock.blocks)
-        mul!(res, block, B[offset .+ (1:size(block, 2)), :], α, i == 1 ? β : true)
-        offset += size(block, 2)
+NVTX.@annotate function LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat,
+                                           B::AbstractMatrix, α::Number, β::Number)
+    @views begin
+        offset = 0
+        for (i, block) in enumerate(Ablock.blocks)
+            mul!(res, block, B[offset .+ (1:size(block, 2)), :], α, i == 1 ? β : true)
+            offset += size(block, 2)
+        end
+        res
     end
-    res
 end
-LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat, B::AbstractMatrix) =
+NVTX.@annotate LinearAlgebra.mul!(res::AbstractMatrix, Ablock::LazyHcat, B::AbstractMatrix) =
     mul!(res, Ablock, B, true, false)
-function *(Ablock::LazyHcat, B::AbstractMatrix)
+NVTX.@annotate function *(Ablock::LazyHcat, B::AbstractMatrix)
     res = zeros_like(B, size(Ablock, 1), size(B, 2))
     mul!(res, Ablock, B)
 end
 
 
 # Perform a Rayleigh-Ritz for the N first eigenvectors.
-function rayleigh_ritz(X, AX, N)
+NVTX.@annotate function rayleigh_ritz(X, AX, N)
     XAX = mul_hermi(X', AX)
     @assert !any(isnan, UpperTriangular(parent(XAX)))
     rayleigh_ritz(XAX, N)
 end
-@views function rayleigh_ritz(XAX::Hermitian, N)
-    # Fallback: Use whatever is the default dense eigensolver.
-    # Note: GenericLinearAlgebra uses a QR-based algorithm, which is pretty safe in terms
-    #       of keeping the vectors orthogonal
-    values, vectors = eigen(XAX)
-    vectors[:, 1:N], values[1:N]
-end
-@views function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:Array}, N)
-    # LAPACK sysevr (the Julia default eigensolver up to 1.11 ) can actually return
-    # eigenvectors that are significantly non-orthogonal (1e-4 in Float32 in some tests)
-    # here, presumably because it tries hard to make them eigenvectors in the presence
-    # of small gaps. syevd (or DivideAndConquer()) does a much better job, see
-    # https://github.com/JuliaLang/julia/pull/49262 and
-    # https://github.com/JuliaLang/julia/pull/49355. It will be the default in 1.12.
-    # For versions < 1.12, since we mainly care about eigenvectors being orthogonal
-    # we re-orthogonalise explicitly.
-    @static if VERSION >= v"1.12"
-        values, vectors = eigen(XAX; alg=LinearAlgebra.DivideAndConquer())
-        return vectors[:, 1:N], values[1:N]
-    else
+NVTX.@annotate function rayleigh_ritz(XAX::Hermitian, N)
+    @views begin
+        # Fallback: Use whatever is the default dense eigensolver.
+        # Note: GenericLinearAlgebra uses a QR-based algorithm, which is pretty safe in terms
+        #       of keeping the vectors orthogonal
         values, vectors = eigen(XAX)
-        v = vectors[:, 1:N]
-        ortho!(v)
-        return v, values[1:N]
+        vectors[:, 1:N], values[1:N]
+    end
+end
+NVTX.@annotate function rayleigh_ritz(XAX::Hermitian{<:BlasFloat, <:Array}, N)
+    @views begin
+        # LAPACK sysevr (the Julia default eigensolver up to 1.11 ) can actually return
+        # eigenvectors that are significantly non-orthogonal (1e-4 in Float32 in some tests)
+        # here, presumably because it tries hard to make them eigenvectors in the presence
+        # of small gaps. syevd (or DivideAndConquer()) does a much better job, see
+        # https://github.com/JuliaLang/julia/pull/49262 and
+        # https://github.com/JuliaLang/julia/pull/49355. It will be the default in 1.12.
+        # For versions < 1.12, since we mainly care about eigenvectors being orthogonal
+        # we re-orthogonalise explicitly.
+        @static if VERSION >= v"1.12"
+            values, vectors = eigen(XAX; alg=LinearAlgebra.DivideAndConquer())
+            return vectors[:, 1:N], values[1:N]
+        else
+            values, vectors = eigen(XAX)
+            v = vectors[:, 1:N]
+            ortho!(v)
+            return v, values[1:N]
+        end
     end
 end
 
@@ -183,7 +191,7 @@ end
 # orthogonal (not B-orthogonal) and B is relatively well-conditioned
 # (which implies that X'BX is relatively well-conditioned, and
 # therefore that it is safe to cholesky it and reuse the B apply)
-function B_ortho!(X, BX)
+NVTX.@annotate function B_ortho!(X, BX)
     O = mul_hermi(X', BX)
     U = cholesky(O).U
     @assert !any(isnan, U)
@@ -195,7 +203,7 @@ end
 # in which case gets something *ressembling* a Cholesky factorization
 # Standard Cholesky factorization can fail when O is ill-conditioned.
 # On the GPU, it fails silently, and NaN elements start appearing.
-function safe_cholesky(O::AbstractArray{T}; nchol=0, α=100) where {T}
+NVTX.@annotate function safe_cholesky(O::AbstractArray{T}; nchol=0, α=100) where {T}
     local R
     local invR
     nchol >= 5 && return nothing, nothing, 10000 # give up
@@ -217,11 +225,11 @@ function safe_cholesky(O::AbstractArray{T}; nchol=0, α=100) where {T}
     R, invR, nchol # we also return invR because it's used in the caller
 end
 
-normest(M) = maximum(abs, diag(M)) + norm(M - Diagonal(diag(M)))
+NVTX.@annotate normest(M) = maximum(abs, diag(M)) + norm(M - Diagonal(diag(M)))
 # Orthogonalizes X to tol
 # Returns the new X, the number of Cholesky factorizations algorithm, and the
 # growth factor by which small perturbations of X can have been magnified
-function ortho!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
+NVTX.@annotate function ortho!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
     growth_factor   = one(real(T))
     estimated_error = one(real(T))
 
@@ -269,7 +277,7 @@ function ortho!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
 end
 
 # Randomize the columns of X if the norm is below tol
-function drop_small!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
+NVTX.@annotate function drop_small!(X::AbstractArray{T}; tol=2eps(real(T))) where {T}
     dropped = findall(n -> n <= tol, columnwise_norms(X))
     @views randn!(TaskLocalRNG(), X[:, dropped])
     dropped
@@ -278,6 +286,7 @@ end
 # Find X that is orthogonal, and B-orthogonal to Y, up to a tolerance tol.
 function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T)),
                 timer=disabled_timer) where {T}
+    NVTX.@range "ortho! X vs Y" begin
     # normalize to try to cheaply improve conditioning
     X ./= columnwise_norms(X)'
 
@@ -328,10 +337,11 @@ function ortho!(X::AbstractArray{T}, Y, BY; tol=2eps(real(T)),
     # @assert (norm(BY'X)) < tol
     # @assert (norm(X'X-I)) < tol
 
+    end
     X
 end
 
-function final_retval(X, AX, BX, λ, resid_history, niter, n_matvec)
+NVTX.@annotate function final_retval(X, AX, BX, λ, resid_history, niter, n_matvec)
     λ_host = to_cpu(λ)  # Copy to CPU for element-wise access
     if !issorted(λ_host)
         p = sortperm(λ_host)
@@ -347,12 +357,12 @@ function final_retval(X, AX, BX, λ, resid_history, niter, n_matvec)
 end
 
 # Computes λ = real((X' * AX) / (X' *BX)), for each column of X
-function compute_λ(X, AX, BX)
+NVTX.@annotate function compute_λ(X, AX, BX)
     λs = @views [real((X[:, n]'*AX[:, n]) / (X[:, n]'BX[:, n])) for n=1:size(X, 2)]
     oftype(real(X[:, 1]), λs)  # Offload to GPU if needed
 end
-function compute_λ(X::AbstractGPUArray{T}, AX::AbstractGPUArray{T},
-                   BX::AbstractGPUArray{T}) where {T}
+NVTX.@annotate function compute_λ(X::AbstractGPUArray{T}, AX::AbstractGPUArray{T},
+                                  BX::AbstractGPUArray{T}) where {T}
     num = sum(conj(X) .* AX, dims=1)
     den = sum(conj(X) .* BX, dims=1)
     vec(real.(num ./ den))
@@ -383,9 +393,9 @@ Eigenvalues `λ` are returned on the CPU; `X` and the history stay on the input 
 The time spent in the individual steps can be recorded into the `TimerOutputs.TimerOutput`
 passed as `timer`.
 """
-function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
-               miniter=1, ortho_tol=2eps(real(eltype(X))),
-               n_conv_check=nothing, callback=identity, timer=disabled_timer)
+NVTX.@annotate function lobpcg(A, X, B=I, precon=I, tol=1e-10, maxiter=100;
+                                miniter=1, ortho_tol=2eps(real(eltype(X))),
+                                n_conv_check=nothing, callback=identity, timer=disabled_timer)
     N, M = size(X)
 
     # If N is too small, we will likely get in trouble
@@ -617,9 +627,9 @@ end
 struct DefaultLobpcgCallback
     prev_time::Ref{UInt64}
 end
-DefaultLobpcgCallback() = DefaultLobpcgCallback(Ref(zero(UInt64)))
+NVTX.@annotate DefaultLobpcgCallback() = DefaultLobpcgCallback(Ref(zero(UInt64)))
 
-function (cb::DefaultLobpcgCallback)(info)
+NVTX.@annotate function (cb::DefaultLobpcgCallback)(info)
     if info.n_iter == 0
         cb.prev_time[] = time_ns()
         println("Iter     Converged     log10(resid)    time  \n")

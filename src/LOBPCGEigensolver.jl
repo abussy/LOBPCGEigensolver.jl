@@ -1,6 +1,7 @@
 module LOBPCGEigensolver
 
 using LinearAlgebra
+using NVTX
 using Printf
 using Random
 using GPUArraysCore
