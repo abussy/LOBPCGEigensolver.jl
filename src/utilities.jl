@@ -3,6 +3,7 @@
 # free of any application-specific dependencies. Device-agnostic versions are
 # defined for generic `AbstractArray`s, with GPU-optimized variants dispatching
 # on `AbstractGPUArray`.
+using AcceleratedKernels
 
 """
 Transfer an array from a device (typically a GPU) to the CPU.
@@ -63,3 +64,35 @@ end
 # preconditioning it will call `precondprep!(P, X)` right before applying the
 # preconditioner. The default is a no-op; concrete preconditioners may override it.
 precondprep!(P, X) = P
+
+### TESTING fused Cholesky diagonostics
+# Analoguous to max(f, A), except that the result is stored in a 1-element GPU array, without sync
+function gpu_max(f, A::AbstractGPUArray{T}) where {T}
+    AcceleratedKernels.mapreduce(f, max, vec(A); init=zero(real(T)), dims=1)
+end
+
+# Analoguous to sum(f, A), except that the result is stored in a 1-element GPU array, without sync
+function gpu_sum(f, A::AbstractGPUArray{T}) where {T}
+    AcceleratedKernels.mapreduce(f, +, vec(A); init=zero(real(T)), dims=1)
+end
+# Analoguous to any(f, A), except that the result is stored in a 1-element GPU array, without sync
+function gpu_any(f, A::AbstractGPUArray{T}) where {T}
+    AcceleratedKernels.mapreduce(f, |, vec(A); init=false, dims=1)
+end
+
+# Analogous to normest(A), except that the result is stored in a 1-element GPU array, without sync
+function gpu_normest(M::AbstractGPUArray{T}) where {T}
+    d = diag(M)
+    offdiag = M - Diagonal(d)
+
+    gpu_max(abs, d) .+ sqrt.(gpu_sum(abs2, offdiag))
+end
+
+function cholesky_diagnostics(R::AbstractGPUArray{T}, invR::AbstractGPUArray{T}) where {T}
+    normR = gpu_normest(R)
+    norminvR = gpu_normest(invR)
+    hasnan = gpu_any(isnan, invR)
+    res = to_cpu(vcat(normR, norminvR, hasnan))  # single GPU to CPU transfer
+    @assert !res[3]
+    (; normR=res[1], norminvR=res[2])
+end
