@@ -77,7 +77,7 @@ function gpu_sum(f, A::AbstractGPUArray{T}) where {T}
 end
 # Analoguous to any(f, A), except that the result is stored in a 1-element GPU array, without sync
 function gpu_any(f, A::AbstractGPUArray{T}) where {T}
-    AcceleratedKernels.mapreduce(f, |, vec(A); init=false, dims=1)
+    AcceleratedKernels.mapreduce(f, |, vec(A); init=false, neutral=false, dims=1)
 end
 
 # Analogous to normest(A), except that the result is stored in a 1-element GPU array, without sync
