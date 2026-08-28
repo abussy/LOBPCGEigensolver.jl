@@ -65,34 +65,39 @@ end
 # preconditioner. The default is a no-op; concrete preconditioners may override it.
 precondprep!(P, X) = P
 
-### TESTING fused Cholesky diagonostics
-# Analoguous to max(f, A), except that the result is stored in a 1-element GPU array, without sync
+# GPU-specific reductions which retuen 1-element GPU arrays instead of scalars, thus avoiding
+# host-device synchronization, until an explicit transfer to the PCU is requested.
+# GPU-specific analog to max(f, A)
 function gpu_max(f, A::AbstractGPUArray{T}) where {T}
-    AcceleratedKernels.mapreduce(f, max, vec(A); init=zero(real(T)), dims=1)
+    U = Base.promote_op(f, T)
+    AcceleratedKernels.mapreduce(f, max, vec(A); init=zero(U), neutral=zero(U), dims=1)
 end
 
-# Analoguous to sum(f, A), except that the result is stored in a 1-element GPU array, without sync
+# GPU-specific analog to sum(f, A)
 function gpu_sum(f, A::AbstractGPUArray{T}) where {T}
-    AcceleratedKernels.mapreduce(f, +, vec(A); init=zero(real(T)), dims=1)
+    U = Base.promote_op(f, T)
+    AcceleratedKernels.mapreduce(f, +, vec(A); init=zero(U), neutral=zero(U), dims=1)
 end
-# Analoguous to any(f, A), except that the result is stored in a 1-element GPU array, without sync
+# GPU-specific analog to any(f, A)
 function gpu_any(f, A::AbstractGPUArray{T}) where {T}
     AcceleratedKernels.mapreduce(f, |, vec(A); init=false, neutral=false, dims=1)
 end
 
-# Analogous to normest(A), except that the result is stored in a 1-element GPU array, without sync
+# GPU-specific analog to normest(A)
 function gpu_normest(M::AbstractGPUArray{T}) where {T}
     d = diag(M)
     offdiag = M - Diagonal(d)
-
     gpu_max(abs, d) .+ sqrt.(gpu_sum(abs2, offdiag))
 end
 
-function cholesky_diagnostics(R::AbstractGPUArray{T}, invR::AbstractGPUArray{T}) where {T}
+# GPU-specific Cholesky diagonostics for GPU arrays. All reductions are performed on the GPU, and a single
+# synchronization is performed when the results are transferred back to the CPU
+function cholesky_diagnostics(R::AbstractGPUArray{T},
+                              invR::AbstractGPUArray{T}) where {T}
     normR = gpu_normest(R)
     norminvR = gpu_normest(invR)
     hasnan = gpu_any(isnan, invR)
-    res = to_cpu(vcat(normR, norminvR, hasnan))  # single GPU to CPU transfer
-    @assert !res[3]
-    (; normR=res[1], norminvR=res[2])
+    diagnostics = to_cpu(vcat(normR, norminvR, hasnan))  # single GPU to CPU transfer
+    @assert !diagnostics[3]
+    (; normR=diagnostics[1], norminvR=diagnostics[2])
 end
